@@ -475,6 +475,83 @@ void handleBlockStatus(String blocker, String blocked, bool isBlock) {
   } catch (...) {}
 }
 
+void sendInitialData(uint8_t num, String username) {
+  try {
+    DynamicJsonDocument connResp(4096);
+    connResp["event"] = "connections_list";
+    JsonArray connArrData = connResp.createNestedArray("data");
+    String connData = readFS("/connections.json");
+    DynamicJsonDocument connDoc(4096);
+    deserializeJson(connDoc, connData);
+    JsonArray connArr = connDoc.as<JsonArray>();
+    for (JsonObject c : connArr) {
+      String u1 = c["user1"]["username"] | "";
+      String u2 = c["user2"]["username"] | "";
+      if (u1 == username || u2 == username) {
+        String peer = (u1 == username) ? u2 : u1;
+        JsonObject row = connArrData.createNestedObject();
+        row["username"] = peer;
+        uint8_t dummy;
+        row["active"] = isUserActive(peer, dummy);
+        bool bMe, bPeer;
+        isBlocked(username, peer, bMe, bPeer);
+        row["blockedByMe"] = bMe;
+        row["blockedByPeer"] = bPeer;
+      }
+    }
+    String connOut;
+    serializeJson(connResp, connOut);
+    webSocket.sendTXT(num, connOut);
+
+    DynamicJsonDocument grpResp(4096);
+    grpResp["event"] = "groups_list";
+    JsonArray grpArrData = grpResp.createNestedArray("data");
+    String gData = readFS("/groups.json");
+    DynamicJsonDocument groupsDoc(4096);
+    deserializeJson(groupsDoc, gData);
+    JsonArray groupsArr = groupsDoc.as<JsonArray>();
+    for (JsonObject g : groupsArr) {
+      JsonArray users = g["users"].as<JsonArray>();
+      bool isMember = false;
+      for (String u : users) {
+        if (u == username) { isMember = true; break; }
+      }
+      if (isMember) {
+        JsonObject row = grpArrData.createNestedObject();
+        row["id"] = g["id"];
+        row["name"] = g["name"];
+        int activeCount = 0;
+        for (String u : users) {
+          uint8_t d;
+          if (isUserActive(u, d)) activeCount++;
+        }
+        row["activeCount"] = activeCount;
+      }
+    }
+    String grpOut;
+    serializeJson(grpResp, grpOut);
+    webSocket.sendTXT(num, grpOut);
+
+    DynamicJsonDocument blkResp(4096);
+    blkResp["event"] = "block_list";
+    JsonArray blkArrData = blkResp.createNestedArray("data");
+    String bData = readFS("/block_list.json");
+    DynamicJsonDocument blkDoc(4096);
+    deserializeJson(blkDoc, bData);
+    JsonArray blkArr = blkDoc.as<JsonArray>();
+    for (JsonObject b : blkArr) {
+      if (b["blocker"] == username) {
+        JsonObject row = blkArrData.createNestedObject();
+        row["username"] = b["blocked"];
+      }
+    }
+    String blkOut;
+    serializeJson(blkResp, blkOut);
+    webSocket.sendTXT(num, blkOut);
+
+  } catch (...) {}
+}
+
 void savePendingAction(String target, String eventName, String peer, String timestamp = "", String text = "") {
   try {
     String data = readFS("/pending_deletes.json");
@@ -493,6 +570,45 @@ void savePendingAction(String target, String eventName, String peer, String time
     String out;
     serializeJson(doc, out);
     writeFS("/pending_deletes.json", out);
+  } catch (...) {}
+}
+
+void sendGroupSystemMessage(String groupId, String msgText) {
+  try {
+    String gData = readFS("/groups.json");
+    DynamicJsonDocument groupsDoc(4096);
+    deserializeJson(groupsDoc, gData);
+    JsonArray groupsArr = groupsDoc.as<JsonArray>();
+
+    for (JsonObject g : groupsArr) {
+      if (g["id"] == groupId) {
+        JsonArray users = g["users"].as<JsonArray>();
+        
+        DynamicJsonDocument fwdDoc(4096);
+        fwdDoc["event"] = "group_message";
+        JsonObject data = fwdDoc.createNestedObject("data");
+        data["groupId"] = groupId;
+        data["sender"] = "System";
+        data["text"] = msgText;
+        data["type"] = "text";
+        data["timestamp"] = "Now";
+        
+        String fwdStr;
+        serializeJson(fwdDoc, fwdStr);
+        
+        for (String u : users) {
+          uint8_t targetNum;
+          if (isUserActive(u, targetNum)) {
+            webSocket.sendTXT(targetNum, fwdStr);
+          }
+        }
+        
+        String rawStr;
+        serializeJson(data, rawStr);
+        sendLoRa("group_message", String(millis()), rawStr);
+        break;
+      }
+    }
   } catch (...) {}
 }
 
@@ -575,6 +691,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             String output;
             serializeJson(resp, output);
             webSocket.sendTXT(num, output);
+            
+            if (loginSuccess) {
+                sendInitialData(num, username);
+            }
           } else if (event == "token_validate") {
             String token = doc["data"]["token"] | "";
             String username = "";
@@ -592,6 +712,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             String output;
             serializeJson(resp, output);
             webSocket.sendTXT(num, output);
+            
+            if (isValid) {
+                sendInitialData(num, username);
+            }
           } else if (event == "connect_user") {
             String targetPeer = doc["data"]["username"] | "";
             bool userExists = false;
@@ -646,6 +770,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
               String output;
               serializeJson(resp, output);
               webSocket.sendTXT(num, output);
+              sendInitialData(num, initiator);
             } else {
               DynamicJsonDocument resp(256);
               resp["event"] = "connect_user_response";
@@ -665,34 +790,31 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
                 break;
               }
             }
-            DynamicJsonDocument listResp(4096);
-            listResp["event"] = "connections_list";
-            JsonArray dataArr = listResp.createNestedArray("data");
-
-            String connData = readFS("/connections.json");
-            DynamicJsonDocument connDoc(4096);
-            deserializeJson(connDoc, connData);
-            JsonArray connArr = connDoc.as<JsonArray>();
-
-            for (JsonObject c : connArr) {
-              String u1 = c["user1"]["username"] | "";
-              String u2 = c["user2"]["username"] | "";
-              if (u1 == activeUser || u2 == activeUser) {
-                String peer = (u1 == activeUser) ? u2 : u1;
-                JsonObject row = dataArr.createNestedObject();
-                row["username"] = peer;
-                uint8_t dummy;
-                row["active"] = isUserActive(peer, dummy);
-                
-                bool bMe, bPeer;
-                isBlocked(activeUser, peer, bMe, bPeer);
-                row["blockedByMe"] = bMe;
-                row["blockedByPeer"] = bPeer;
+            sendInitialData(num, activeUser);
+          } else if (event == "get_block_list") {
+            String activeUser = "";
+            for (const auto& c : activeClients) {
+              if (c.num == num) {
+                activeUser = c.username;
+                break;
               }
             }
-            String output;
-            serializeJson(listResp, output);
-            webSocket.sendTXT(num, output);
+            DynamicJsonDocument blkResp(4096);
+            blkResp["event"] = "block_list";
+            JsonArray blkArrData = blkResp.createNestedArray("data");
+            String bData = readFS("/block_list.json");
+            DynamicJsonDocument blkDoc(4096);
+            deserializeJson(blkDoc, bData);
+            JsonArray blkArr = blkDoc.as<JsonArray>();
+            for (JsonObject b : blkArr) {
+              if (b["blocker"] == activeUser) {
+                JsonObject row = blkArrData.createNestedObject();
+                row["username"] = b["blocked"];
+              }
+            }
+            String blkOut;
+            serializeJson(blkResp, blkOut);
+            webSocket.sendTXT(num, blkOut);
           } else if (event == "group_create") {
             String groupName = doc["data"]["groupName"] | "";
             String creator = "";
@@ -742,6 +864,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             String output;
             serializeJson(resp, output);
             webSocket.sendTXT(num, output);
+            sendInitialData(num, creator);
           } else if (event == "group_join") {
             String groupId = doc["data"]["groupId"] | "";
             String joinUser = "";
@@ -771,7 +894,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
                     break;
                   }
                 }
-                if (!alreadyIn) users.add(joinUser);
+                if (!alreadyIn) {
+                    users.add(joinUser);
+                }
                 break;
               }
             }
@@ -780,6 +905,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
               String outStr;
               serializeJson(groupsDoc, outStr);
               writeFS("/groups.json", outStr);
+              sendGroupSystemMessage(groupId, joinUser + " joined the group.");
             }
 
             DynamicJsonDocument resp(256);
@@ -791,6 +917,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             String output;
             serializeJson(resp, output);
             webSocket.sendTXT(num, output);
+            if (groupFound) sendInitialData(num, joinUser);
           } else if (event == "get_groups") {
             String activeUser = "";
             for (const auto& c : activeClients) {
@@ -799,40 +926,29 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
                 break;
               }
             }
-            DynamicJsonDocument listResp(4096);
-            listResp["event"] = "groups_list";
-            JsonArray dataArr = listResp.createNestedArray("data");
-
+            sendInitialData(num, activeUser);
+          } else if (event == "get_group_info") {
+            String groupId = doc["data"]["groupId"] | "";
             String gData = readFS("/groups.json");
             DynamicJsonDocument groupsDoc(4096);
             deserializeJson(groupsDoc, gData);
             JsonArray groupsArr = groupsDoc.as<JsonArray>();
 
             for (JsonObject g : groupsArr) {
-              JsonArray users = g["users"].as<JsonArray>();
-              bool isMember = false;
-              for (String u : users) {
-                if (u == activeUser) {
-                  isMember = true;
-                  break;
-                }
-              }
-              if (isMember) {
-                JsonObject row = dataArr.createNestedObject();
-                row["id"] = g["id"];
-                row["name"] = g["name"];
-                int activeCount = 0;
-                for (String u : users) {
-                  uint8_t d;
-                  if (isUserActive(u, d)) activeCount++;
-                }
-                row["activeCount"] = activeCount;
+              if (g["id"] == groupId) {
+                DynamicJsonDocument resp(1024);
+                resp["event"] = "group_info_res";
+                JsonObject data = resp.createNestedObject("data");
+                data["groupId"] = groupId;
+                data["users"] = g["users"];
+                data["admins"] = g["admins"];
+                String output;
+                serializeJson(resp, output);
+                webSocket.sendTXT(num, output);
+                break;
               }
             }
-            String output;
-            serializeJson(listResp, output);
-            webSocket.sendTXT(num, output);
-          } else if (event == "message") {
+          } else if (event == "message" || event == "image" || event == "location") {
             String sender = doc["data"]["sender"] | "";
             String receiver = doc["data"]["receiver"] | "";
             
@@ -921,6 +1037,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             String rawStr;
             serializeJson(doc["data"], rawStr);
             sendLoRa(event, String(millis()), rawStr);
+            sendInitialData(num, sender);
           } else if (event == "delete_chat_both") {
             String target = doc["data"]["target"] | "";
             String sender = doc["data"]["sender"] | "";
@@ -962,6 +1079,83 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             String rawStr;
             serializeJson(doc["data"], rawStr);
             sendLoRa("delete_message_both", String(millis()), rawStr);
+          } else if (event == "delete_group_message_both") {
+            String groupId = doc["data"]["groupId"] | "";
+            String sender = doc["data"]["sender"] | "";
+            
+            String gData = readFS("/groups.json");
+            DynamicJsonDocument groupsDoc(4096);
+            deserializeJson(groupsDoc, gData);
+            JsonArray groupsArr = groupsDoc.as<JsonArray>();
+
+            for (JsonObject g : groupsArr) {
+              if (g["id"] == groupId) {
+                JsonArray users = g["users"].as<JsonArray>();
+                for (String u : users) {
+                  if (u != sender) {
+                    uint8_t targetNum;
+                    if (isUserActive(u, targetNum)) {
+                      DynamicJsonDocument fwdDoc(512);
+                      fwdDoc["event"] = "delete_group_message_both";
+                      fwdDoc["data"] = doc["data"];
+                      String fwdStr;
+                      serializeJson(fwdDoc, fwdStr);
+                      webSocket.sendTXT(targetNum, fwdStr);
+                    }
+                  }
+                }
+                break;
+              }
+            }
+            
+            String rawStr;
+            serializeJson(doc["data"], rawStr);
+            sendLoRa("delete_group_message_both", String(millis()), rawStr);
+          } else if (event == "group_leave" || event == "group_remove_user" || event == "group_add_admin" || event == "group_remove_admin") {
+            String groupId = doc["data"]["groupId"] | "";
+            String target = (event == "group_leave") ? (doc["data"]["sender"] | "") : (doc["data"]["target"] | "");
+            
+            String gData = readFS("/groups.json");
+            DynamicJsonDocument groupsDoc(4096);
+            deserializeJson(groupsDoc, gData);
+            JsonArray groupsArr = groupsDoc.as<JsonArray>();
+            
+            bool changed = false;
+            for (JsonObject g : groupsArr) {
+              if (g["id"] == groupId) {
+                JsonArray users = g["users"].as<JsonArray>();
+                JsonArray admins = g["admins"].as<JsonArray>();
+                
+                if (event == "group_leave" || event == "group_remove_user") {
+                  for (int i=0; i<users.size(); i++) {
+                      if (users[i] == target) { users.remove(i); break; }
+                  }
+                  for (int i=0; i<admins.size(); i++) {
+                      if (admins[i] == target) { admins.remove(i); break; }
+                  }
+                  changed = true;
+                } else if (event == "group_add_admin") {
+                  bool found = false;
+                  for (String a : admins) { if (a == target) found = true; }
+                  if (!found) { admins.add(target); changed = true; }
+                } else if (event == "group_remove_admin") {
+                  for (int i=0; i<admins.size(); i++) {
+                      if (admins[i] == target) { admins.remove(i); changed = true; break; }
+                  }
+                }
+                break;
+              }
+            }
+            
+            if (changed) {
+              String outStr;
+              serializeJson(groupsDoc, outStr);
+              writeFS("/groups.json", outStr);
+              
+              String rawStr;
+              serializeJson(doc["data"], rawStr);
+              sendLoRa(event, String(millis()), rawStr);
+            }
           }
         }
         break;
@@ -1168,6 +1362,75 @@ void handleIncomingLoRaPacket(int packetSize) {
             webSocket.sendTXT(targetNum, fwdStr);
           } else {
             savePendingAction(target, "delete_message_both", sender, innerDoc["timestamp"] | "", innerDoc["text"] | "");
+          }
+        } else if (type == "delete_group_message_both") {
+          String groupId = innerDoc["groupId"] | "";
+          String sender = innerDoc["sender"] | "";
+
+          String gData = readFS("/groups.json");
+          DynamicJsonDocument groupsDoc(4096);
+          deserializeJson(groupsDoc, gData);
+          JsonArray groupsArr = groupsDoc.as<JsonArray>();
+
+          for (JsonObject g : groupsArr) {
+            if (g["id"] == groupId) {
+              JsonArray users = g["users"].as<JsonArray>();
+              for (String u : users) {
+                if (u != sender) {
+                  uint8_t targetNum;
+                  if (isUserActive(u, targetNum)) {
+                    DynamicJsonDocument fwdDoc(512);
+                    fwdDoc["event"] = "delete_group_message_both";
+                    fwdDoc["data"] = innerDoc;
+                    String fwdStr;
+                    serializeJson(fwdDoc, fwdStr);
+                    webSocket.sendTXT(targetNum, fwdStr);
+                  }
+                }
+              }
+              break;
+            }
+          }
+        } else if (type == "group_leave" || type == "group_remove_user" || type == "group_add_admin" || type == "group_remove_admin") {
+          String groupId = innerDoc["groupId"] | "";
+          String target = (type == "group_leave") ? (innerDoc["sender"] | "") : (innerDoc["target"] | "");
+            
+          String gData = readFS("/groups.json");
+          DynamicJsonDocument groupsDoc(4096);
+          deserializeJson(groupsDoc, gData);
+          JsonArray groupsArr = groupsDoc.as<JsonArray>();
+            
+          bool changed = false;
+          for (JsonObject g : groupsArr) {
+            if (g["id"] == groupId) {
+              JsonArray users = g["users"].as<JsonArray>();
+              JsonArray admins = g["admins"].as<JsonArray>();
+                
+              if (type == "group_leave" || type == "group_remove_user") {
+                for (int i=0; i<users.size(); i++) {
+                    if (users[i] == target) { users.remove(i); break; }
+                }
+                for (int i=0; i<admins.size(); i++) {
+                    if (admins[i] == target) { admins.remove(i); break; }
+                }
+                changed = true;
+              } else if (type == "group_add_admin") {
+                bool found = false;
+                for (String a : admins) { if (a == target) found = true; }
+                if (!found) { admins.add(target); changed = true; }
+              } else if (type == "group_remove_admin") {
+                for (int i=0; i<admins.size(); i++) {
+                    if (admins[i] == target) { admins.remove(i); changed = true; break; }
+                }
+              }
+              break;
+            }
+          }
+            
+          if (changed) {
+            String outStr;
+            serializeJson(groupsDoc, outStr);
+            writeFS("/groups.json", outStr);
           }
         } else if (type == "app_version_req") {
           if (sdAvailable && currentAppVersion > 0) {
