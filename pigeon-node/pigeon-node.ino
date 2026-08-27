@@ -58,71 +58,151 @@ struct ActiveClient {
 };
 vector<ActiveClient> activeClients;
 
+struct RemoteUser {
+  String username;
+  unsigned long lastSeen;
+};
+vector<RemoteUser> remoteActiveUsers;
+
+struct SyncTask {
+  String fileKey;
+  String targetNode;
+};
+vector<SyncTask> syncQueue;
+bool isSyncing = false;
+unsigned long lastSyncRequestTime = 0;
+String currentSyncFile = "";
+String syncBuffer = "";
+int expectedChunkIndex = 0;
+
+String msgBuffer = "";
+String currentMsgReqId = "";
+int expectedMsgChunkIndex = 0;
+unsigned long lastChunkRxTime = 0;
+
+struct TxTask {
+  String type;
+  String fileKey;
+  int version;
+  String msgType;
+  String fullBase64Data;
+  int totalChunks;
+};
+vector<TxTask> txQueue;
+int currentChunkIdx = 0;
+unsigned long lastTxTime = 0;
+
 unsigned long lastBeaconTime = 0;
+unsigned long lastVersionCheckTime = 0;
+unsigned long lastPresenceTime = 0;
 bool sdAvailable = false;
 int prevClientsCount = -1;
 String oledStatus = "System Boot...";
 float currentAppVersion = 0.0;
 bool isDownloadingApp = false;
-int expectedAppChunks = 0;
-int currentAppChunk = 0;
 
-void loadWifiConfig() {
-  try {
-    if (SPIFFS.exists("/wifi_data.json")) {
-      File file = SPIFFS.open("/wifi_data.json", "r");
-      if (file) {
-        DynamicJsonDocument doc(512);
-        DeserializationError err = deserializeJson(doc, file);
-        if (!err) {
-          if (doc.containsKey("nodeName")) nodeName = doc["nodeName"].as<String>();
-          if (doc.containsKey("repeaterSSID")) repeaterSSID = doc["repeaterSSID"].as<String>();
-          if (doc.containsKey("repeaterPass")) repeaterPass = doc["repeaterPass"].as<String>();
-        }
-        file.close();
-      }
-    }
-  } catch (...) {}
+void requestNextSyncFile();
+void sendLocalVersions();
+void broadcastVersions();
+void broadcastPresence();
+void notifyAllActiveClients();
+
+bool isReceivingStream() {
+  return ((expectedChunkIndex > 0 || expectedMsgChunkIndex > 0) && (millis() - lastChunkRxTime < 8000));
 }
 
-void saveWifiConfig() {
+bool isLocalActive(String username, uint8_t& outNum) {
+  for (const auto& c : activeClients) {
+    if (c.username == username) {
+      outNum = c.num;
+      return true;
+    }
+  }
+  return false;
+}
+
+bool isRemoteActive(String username) {
+  for (const auto& r : remoteActiveUsers) {
+    if (r.username == username && (millis() - r.lastSeen < 45000)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+String readFS(String path) {
   try {
-    DynamicJsonDocument doc(512);
-    doc["nodeName"] = nodeName;
-    doc["repeaterSSID"] = repeaterSSID;
-    doc["repeaterPass"] = repeaterPass;
-    File file = SPIFFS.open("/wifi_data.json", "w");
+    Serial.println("[FS] Reading file: " + path);
+    if (!SPIFFS.exists(path)) {
+      Serial.println("[FS] File not found, returning empty JSON.");
+      return "{}";
+    }
+    File file = SPIFFS.open(path, "r");
+    if (!file) {
+      Serial.println("[FS] Failed to open file.");
+      return "{}";
+    }
+    String data = file.readString();
+    file.close();
+    Serial.println("[FS] Read successful. Length: " + String(data.length()));
+    return data;
+  } catch (...) {
+    Serial.println("[FS] Exception caught during read.");
+    return "{}";
+  }
+}
+
+void writeFS(String path, String data) {
+  try {
+    Serial.println("[FS] Writing file: " + path + " | Length: " + String(data.length()));
+    File file = SPIFFS.open(path, "w");
     if (file) {
-      serializeJson(doc, file);
+      file.print(data);
       file.close();
+      Serial.println("[FS] Write successful.");
+    } else {
+      Serial.println("[FS] Failed to open file for writing.");
     }
+  } catch (...) {
+    Serial.println("[FS] Exception caught during write.");
+  }
+}
+
+int getFileVersion(String fileKey) {
+  try {
+    String vData = readFS("/data_versions.json");
+    DynamicJsonDocument vDoc(512);
+    deserializeJson(vDoc, vData);
+    int version = vDoc[fileKey] | 0;
+    return version;
+  } catch (...) { return 0; }
+}
+
+int incrementFileVersion(String fileKey) {
+  try {
+    Serial.println("[VERSION] Incrementing version for: " + fileKey);
+    String vData = readFS("/data_versions.json");
+    DynamicJsonDocument vDoc(512);
+    deserializeJson(vDoc, vData);
+    int v = (vDoc[fileKey] | 0) + 1;
+    vDoc[fileKey] = v;
+    String out;
+    serializeJson(vDoc, out);
+    writeFS("/data_versions.json", out);
+    return v;
+  } catch (...) { return 1; }
+}
+
+void setFileVersion(String fileKey, int version) {
+  try {
+    String vData = readFS("/data_versions.json");
+    DynamicJsonDocument vDoc(512);
+    deserializeJson(vDoc, vData);
+    vDoc[fileKey] = version;
+    String out;
+    serializeJson(vDoc, out);
+    writeFS("/data_versions.json", out);
   } catch (...) {}
-}
-
-String base64Encode(String input) {
-  try {
-    unsigned char out[32];
-    size_t out_len;
-    mbedtls_base64_encode(out, sizeof(out), &out_len, (const unsigned char*)input.c_str(), input.length());
-    return String((char*)out);
-  } catch (...) {
-    return "";
-  }
-}
-
-String generatePassword(String deviceName) {
-  try {
-    String b64 = base64Encode(deviceName);
-    if (b64.length() > 8) {
-      b64 = b64.substring(0, 8);
-    }
-    while (b64.length() < 8) {
-      b64 += "7";
-    }
-    return b64;
-  } catch (...) {
-    return "12345678";
-  }
 }
 
 String applySalt(String data) {
@@ -178,6 +258,7 @@ void updateDisplay() {
 
 void sendLoRa(String type, String reqId, String rawData) {
   try {
+    Serial.println("[LORA_TX] Building packet -> Type: " + type + ", ReqID: " + reqId);
     DynamicJsonDocument doc(4096);
     doc["type"] = type;
     doc["req_id"] = reqId;
@@ -186,53 +267,230 @@ void sendLoRa(String type, String reqId, String rawData) {
     String payload;
     serializeJson(doc, payload);
 
+    Serial.println("[LORA_TX] Payload Size: " + String(payload.length()) + " bytes");
     LoRa.beginPacket();
     LoRa.print(payload);
     LoRa.endPacket();
 
     oledStatus = "TX: " + type;
     updateDisplay();
-  } catch (...) {}
-}
-
-String readFS(String path) {
-  try {
-    if (!SPIFFS.exists(path)) return "{}";
-    File file = SPIFFS.open(path, "r");
-    if (!file) return "{}";
-    String data = file.readString();
-    file.close();
-    return data;
+    Serial.println("[LORA_TX] Packet transmitted over RF.");
   } catch (...) {
-    return "{}";
+    Serial.println("[LORA_TX] Exception caught during RF transmission.");
   }
 }
 
-void writeFS(String path, String data) {
+String base64Encode(String input) {
   try {
-    File file = SPIFFS.open(path, "w");
+    size_t outputLength = 4 * ((input.length() + 2) / 3) + 1;
+    unsigned char* out = (unsigned char*)malloc(outputLength);
+    if (!out) return "";
+    size_t actual_len;
+    int res = mbedtls_base64_encode(out, outputLength, &actual_len, (const unsigned char*)input.c_str(), input.length());
+    if (res != 0) { free(out); return ""; }
+    out[actual_len] = '\0';
+    String encoded = String((char*)out);
+    free(out);
+    return encoded;
+  } catch (...) {
+    return "";
+  }
+}
+
+String base64Decode(String input) {
+  try {
+    size_t outputLength = input.length() / 4 * 3 + 1;
+    unsigned char* out = (unsigned char*)malloc(outputLength);
+    if (!out) return "";
+    size_t actual_len;
+    int res = mbedtls_base64_decode(out, outputLength, &actual_len, (const unsigned char*)input.c_str(), input.length());
+    if (res != 0) { free(out); return ""; }
+    out[actual_len] = '\0';
+    String decoded = String((char*)out);
+    free(out);
+    return decoded;
+  } catch (...) {
+    return "";
+  }
+}
+
+void queueFileChunks(String fileKey, int v, String content) {
+    txQueue.clear(); 
+    currentChunkIdx = 0;
+    
+    TxTask t;
+    t.type = "sync";
+    t.fileKey = fileKey;
+    t.version = v;
+    t.fullBase64Data = base64Encode(content);
+    t.totalChunks = (t.fullBase64Data.length() + 48 - 1) / 48;
+    
+    Serial.println("[SYNC_TX] Encoded " + fileKey + " to Base64. Slicing into " + String(t.totalChunks) + " chunks for safe transmission.");
+    txQueue.push_back(t);
+}
+
+void queueMessageChunks(String msgType, String reqId, String content) {
+    TxTask t;
+    t.type = "msg";
+    t.fileKey = reqId;
+    t.msgType = msgType;
+    t.version = 0;
+    t.fullBase64Data = base64Encode(content);
+    t.totalChunks = (t.fullBase64Data.length() + 48 - 1) / 48;
+    
+    Serial.println("[MSG_TX] Encoded message payload to Base64. Slicing into " + String(t.totalChunks) + " chunks for safe transmission.");
+    txQueue.push_back(t);
+}
+
+void broadcastFileUpdateWithoutIncrement(String fileKey) {
+  try {
+    Serial.println("[SYNC_TX] Enqueueing specific file for requested sync: " + fileKey);
+    int v = getFileVersion(fileKey);
+    String content = readFS("/" + fileKey + ".json");
+    queueFileChunks(fileKey, v, content);
+  } catch (...) {}
+}
+
+void broadcastFileUpdate(String fileKey) {
+  try {
+    Serial.println("[SYNC_TX] Local file modified. Enqueueing mesh broadcast chunks: " + fileKey);
+    int v = incrementFileVersion(fileKey);
+    String content = readFS("/" + fileKey + ".json");
+    queueFileChunks(fileKey, v, content);
+  } catch (...) {}
+}
+
+void broadcastVersions() {
+  try {
+    Serial.println("[SYNC_TX] Broadcasting local version table.");
+    String vData = readFS("/data_versions.json");
+    DynamicJsonDocument doc(1024);
+    doc["node"] = nodeName;
+    doc["versions"] = vData;
+    String out;
+    serializeJson(doc, out);
+    sendLoRa("version_check", String(millis()), out);
+  } catch (...) {}
+}
+
+void broadcastPresence() {
+  try {
+    DynamicJsonDocument doc(512);
+    JsonArray arr = doc.createNestedArray("users");
+    for (const auto& c : activeClients) {
+        arr.add(c.username);
+    }
+    String out;
+    serializeJson(doc, out);
+    sendLoRa("presence", String(millis()), out);
+  } catch (...) {}
+}
+
+void requestVersionsFromClosestNeighbor() {
+  if (neighbors.empty()) return;
+  
+  String bestNode = "";
+  int bestRssi = -9999;
+  for (const auto& n : neighbors) {
+    if (n.rssi > bestRssi) {
+      bestRssi = n.rssi;
+      bestNode = n.nodeName;
+    }
+  }
+  if (bestNode != "") {
+    Serial.println("[SYNC] Requesting version ledger exclusively from closest node: " + bestNode + " (RSSI: " + String(bestRssi) + ")");
+    DynamicJsonDocument reqDoc(256);
+    reqDoc["targetNode"] = bestNode;
+    String reqOut;
+    serializeJson(reqDoc, reqOut);
+    sendLoRa("req_version", String(millis()), reqOut);
+  }
+}
+
+void sendLocalVersions() {
+  try {
+    Serial.println("[SYNC_TX] Transmitting local version ledger directly.");
+    String vData = readFS("/data_versions.json");
+    DynamicJsonDocument doc(1024);
+    doc["node"] = nodeName;
+    doc["versions"] = vData;
+    String out;
+    serializeJson(doc, out);
+    sendLoRa("version_check", String(millis()), out);
+  } catch (...) {}
+}
+
+void loadWifiConfig() {
+  try {
+    Serial.println("[INIT] Loading WiFi config from storage.");
+    if (SPIFFS.exists("/wifi_data.json")) {
+      File file = SPIFFS.open("/wifi_data.json", "r");
+      if (file) {
+        DynamicJsonDocument doc(512);
+        DeserializationError err = deserializeJson(doc, file);
+        if (!err) {
+          if (doc.containsKey("nodeName")) nodeName = doc["nodeName"].as<String>();
+          if (doc.containsKey("repeaterSSID")) repeaterSSID = doc["repeaterSSID"].as<String>();
+          if (doc.containsKey("repeaterPass")) repeaterPass = doc["repeaterPass"].as<String>();
+          Serial.println("[INIT] WiFi config parsed successfully.");
+        }
+        file.close();
+      }
+    }
+  } catch (...) {
+    Serial.println("[INIT] Exception parsing WiFi config.");
+  }
+}
+
+void saveWifiConfig() {
+  try {
+    Serial.println("[INIT] Saving new WiFi config.");
+    DynamicJsonDocument doc(512);
+    doc["nodeName"] = nodeName;
+    doc["repeaterSSID"] = repeaterSSID;
+    doc["repeaterPass"] = repeaterPass;
+    File file = SPIFFS.open("/wifi_data.json", "w");
     if (file) {
-      file.print(data);
+      serializeJson(doc, file);
       file.close();
     }
   } catch (...) {}
 }
 
+String generatePassword(String deviceName) {
+  try {
+    String b64 = base64Encode(deviceName);
+    if (b64.length() > 8) {
+      b64 = b64.substring(0, 8);
+    }
+    while (b64.length() < 8) {
+      b64 += "7";
+    }
+    return b64;
+  } catch (...) {
+    return "12345678";
+  }
+}
+
 bool loadUser(String username, String& storedPassword, String& storedToken) {
   try {
+    Serial.println("[AUTH] Checking credentials for user: " + username);
     String data = readFS("/users.json");
     DynamicJsonDocument doc(4096);
     DeserializationError error = deserializeJson(doc, data);
     if (error) return false;
 
     JsonArray arr = doc.as<JsonArray>();
-    for (JsonObject u : arr) {
-      if (u["username"] == username) {
+    for (int i = 0; i < arr.size(); i++) {
+      JsonObject u = arr[i];
+      if (u["username"].as<String>() == username) {
         storedPassword = u["password"].as<String>();
         storedToken = u["token"].as<String>();
+        Serial.println("[AUTH] User authentication block found.");
         return true;
       }
     }
+    Serial.println("[AUTH] User not found in local registry.");
     return false;
   } catch (...) {
     return false;
@@ -241,6 +499,7 @@ bool loadUser(String username, String& storedPassword, String& storedToken) {
 
 bool saveUser(String username, String password, String token) {
   try {
+    Serial.println("[AUTH] Saving new user credentials: " + username);
     String data = readFS("/users.json");
     DynamicJsonDocument doc(4096);
     deserializeJson(doc, data);
@@ -249,8 +508,9 @@ bool saveUser(String username, String password, String token) {
     if (arr.isNull()) arr = doc.to<JsonArray>();
 
     bool found = false;
-    for (JsonObject u : arr) {
-      if (u["username"] == username) {
+    for (int i = 0; i < arr.size(); i++) {
+      JsonObject u = arr[i];
+      if (u["username"].as<String>() == username) {
         u["password"] = password;
         u["token"] = token;
         found = true;
@@ -268,6 +528,7 @@ bool saveUser(String username, String password, String token) {
     String out;
     serializeJson(doc, out);
     writeFS("/users.json", out);
+    Serial.println("[AUTH] User credentials committed to storage.");
     return true;
   } catch (...) {
     return false;
@@ -276,18 +537,22 @@ bool saveUser(String username, String password, String token) {
 
 bool validateStoredToken(String token, String& username) {
   try {
+    Serial.println("[AUTH] Validating session token.");
     String data = readFS("/users.json");
     DynamicJsonDocument doc(4096);
     DeserializationError error = deserializeJson(doc, data);
     if (error) return false;
 
     JsonArray arr = doc.as<JsonArray>();
-    for (JsonObject u : arr) {
-      if (u["token"] == token) {
+    for (int i = 0; i < arr.size(); i++) {
+      JsonObject u = arr[i];
+      if (u["token"].as<String>() == token) {
         username = u["username"].as<String>();
+        Serial.println("[AUTH] Token valid for user: " + username);
         return true;
       }
     }
+    Serial.println("[AUTH] Token rejection. Invalid or expired.");
     return false;
   } catch (...) {
     return false;
@@ -301,6 +566,7 @@ String generateToken(String username) {
 
 void registerActiveClient(uint8_t num, String username) {
   try {
+    Serial.println("[WSS] Registering active socket client: " + username);
     for (auto it = activeClients.begin(); it != activeClients.end(); ++it) {
       if (it->num == num) {
         activeClients.erase(it);
@@ -312,6 +578,8 @@ void registerActiveClient(uint8_t num, String username) {
     c.username = username;
     activeClients.push_back(c);
     
+    broadcastPresence();
+
     String pData = readFS("/pending_deletes.json");
     DynamicJsonDocument pDoc(4096);
     deserializeJson(pDoc, pData);
@@ -321,8 +589,10 @@ void registerActiveClient(uint8_t num, String username) {
     DynamicJsonDocument newPDoc(4096);
     JsonArray newPArr = newPDoc.to<JsonArray>();
     
-    for (JsonObject p : pArr) {
-      if (p["target"] == username) {
+    for (int i = 0; i < pArr.size(); i++) {
+      JsonObject p = pArr[i];
+      if (p["target"].as<String>() == username) {
+        Serial.println("[QUEUE] Executing offline pending delete action for: " + username);
         DynamicJsonDocument fwdDoc(256);
         fwdDoc["event"] = p["event"];
         JsonObject dData = fwdDoc.createNestedObject("data");
@@ -351,31 +621,20 @@ void registerActiveClient(uint8_t num, String username) {
 
 void unregisterActiveClient(uint8_t num) {
   try {
+    Serial.println("[WSS] Dropping active socket client: " + String(num));
     for (auto it = activeClients.begin(); it != activeClients.end(); ++it) {
       if (it->num == num) {
         activeClients.erase(it);
         break;
       }
     }
+    broadcastPresence();
   } catch (...) {}
-}
-
-bool isUserActive(String username, uint8_t& outNum) {
-  try {
-    for (const auto& c : activeClients) {
-      if (c.username == username) {
-        outNum = c.num;
-        return true;
-      }
-    }
-    return false;
-  } catch (...) {
-    return false;
-  }
 }
 
 void sendInfoEvent(uint8_t num) {
   try {
+    Serial.println("[WSS] Pushing info event to socket: " + String(num));
     DynamicJsonDocument doc(256);
     doc["event"] = "info";
     JsonObject data = doc.createNestedObject("data");
@@ -388,6 +647,7 @@ void sendInfoEvent(uint8_t num) {
 }
 
 void requestAppFromMesh() {
+  Serial.println("[APP] Initiating App transfer request from Mesh.");
   isDownloadingApp = true;
   oledStatus = "Req Mesh App DL";
   updateDisplay();
@@ -399,14 +659,17 @@ void requestAppFromMesh() {
 }
 
 void handleAppVersionCheck() {
+  Serial.println("[APP] Validating local App manifest.");
   if (sdAvailable && SD.exists("/app/app-version.txt")) {
     File file = SD.open("/app/app-version.txt", "r");
     if (file) {
       String verStr = file.readString();
       currentAppVersion = verStr.toFloat();
       file.close();
+      Serial.println("[APP] Local APK Version identified: " + String(currentAppVersion));
     }
   } else {
+    Serial.println("[APP] No local APK available.");
     requestAppFromMesh();
   }
   DynamicJsonDocument doc(256);
@@ -424,7 +687,8 @@ bool isBlocked(String u1, String u2, bool &u1BlockedU2, bool &u2BlockedU1) {
     DynamicJsonDocument doc(4096);
     deserializeJson(doc, data);
     JsonArray arr = doc.as<JsonArray>();
-    for (JsonObject b : arr) {
+    for (int i = 0; i < arr.size(); i++) {
+      JsonObject b = arr[i];
       String blocker = b["blocker"].as<String>();
       String blocked = b["blocked"].as<String>();
       if (blocker == u1 && blocked == u2) u1BlockedU2 = true;
@@ -436,6 +700,7 @@ bool isBlocked(String u1, String u2, bool &u1BlockedU2, bool &u2BlockedU1) {
 
 void handleBlockStatus(String blocker, String blocked, bool isBlock) {
   try {
+    Serial.println("[POLICY] Processing block rule change. Target: " + blocked);
     String data = readFS("/block_list.json");
     DynamicJsonDocument doc(4096);
     deserializeJson(doc, data);
@@ -446,8 +711,9 @@ void handleBlockStatus(String blocker, String blocked, bool isBlock) {
     DynamicJsonDocument newDoc(4096);
     JsonArray newArr = newDoc.to<JsonArray>();
     
-    for (JsonObject b : arr) {
-      if (b["blocker"] == blocker && b["blocked"] == blocked) {
+    for (int i = 0; i < arr.size(); i++) {
+      JsonObject b = arr[i];
+      if (b["blocker"].as<String>() == blocker && b["blocked"].as<String>() == blocked) {
         if (!isBlock) changed = true;
       } else {
         newArr.add(b);
@@ -456,8 +722,9 @@ void handleBlockStatus(String blocker, String blocked, bool isBlock) {
     
     if (isBlock) {
       bool found = false;
-      for (JsonObject b : newArr) {
-        if (b["blocker"] == blocker && b["blocked"] == blocked) found = true;
+      for (int i = 0; i < newArr.size(); i++) {
+        JsonObject b = newArr[i];
+        if (b["blocker"].as<String>() == blocker && b["blocked"].as<String>() == blocked) found = true;
       }
       if (!found) {
         JsonObject nb = newArr.createNestedObject();
@@ -468,15 +735,18 @@ void handleBlockStatus(String blocker, String blocked, bool isBlock) {
     }
     
     if (changed) {
+      Serial.println("[POLICY] Block list modified and saving.");
       String out;
       serializeJson(newDoc, out);
       writeFS("/block_list.json", out);
+      broadcastFileUpdate("block_list");
     }
   } catch (...) {}
 }
 
 void sendInitialData(uint8_t num, String username) {
   try {
+    Serial.println("[WSS] Pushing initial sync data to client ID: " + String(num));
     DynamicJsonDocument connResp(4096);
     connResp["event"] = "connections_list";
     JsonArray connArrData = connResp.createNestedArray("data");
@@ -484,7 +754,8 @@ void sendInitialData(uint8_t num, String username) {
     DynamicJsonDocument connDoc(4096);
     deserializeJson(connDoc, connData);
     JsonArray connArr = connDoc.as<JsonArray>();
-    for (JsonObject c : connArr) {
+    for (int i = 0; i < connArr.size(); i++) {
+      JsonObject c = connArr[i];
       String u1 = c["user1"]["username"] | "";
       String u2 = c["user2"]["username"] | "";
       if (u1 == username || u2 == username) {
@@ -492,7 +763,7 @@ void sendInitialData(uint8_t num, String username) {
         JsonObject row = connArrData.createNestedObject();
         row["username"] = peer;
         uint8_t dummy;
-        row["active"] = isUserActive(peer, dummy);
+        row["active"] = isLocalActive(peer, dummy) || isRemoteActive(peer);
         bool bMe, bPeer;
         isBlocked(username, peer, bMe, bPeer);
         row["blockedByMe"] = bMe;
@@ -510,20 +781,21 @@ void sendInitialData(uint8_t num, String username) {
     DynamicJsonDocument groupsDoc(4096);
     deserializeJson(groupsDoc, gData);
     JsonArray groupsArr = groupsDoc.as<JsonArray>();
-    for (JsonObject g : groupsArr) {
+    for (int i = 0; i < groupsArr.size(); i++) {
+      JsonObject g = groupsArr[i];
       JsonArray users = g["users"].as<JsonArray>();
       bool isMember = false;
-      for (String u : users) {
-        if (u == username) { isMember = true; break; }
+      for (int j = 0; j < users.size(); j++) {
+        if (users[j].as<String>() == username) { isMember = true; break; }
       }
       if (isMember) {
         JsonObject row = grpArrData.createNestedObject();
         row["id"] = g["id"];
         row["name"] = g["name"];
         int activeCount = 0;
-        for (String u : users) {
+        for (int j = 0; j < users.size(); j++) {
           uint8_t d;
-          if (isUserActive(u, d)) activeCount++;
+          if (isLocalActive(users[j].as<String>(), d) || isRemoteActive(users[j].as<String>())) activeCount++;
         }
         row["activeCount"] = activeCount;
       }
@@ -539,8 +811,9 @@ void sendInitialData(uint8_t num, String username) {
     DynamicJsonDocument blkDoc(4096);
     deserializeJson(blkDoc, bData);
     JsonArray blkArr = blkDoc.as<JsonArray>();
-    for (JsonObject b : blkArr) {
-      if (b["blocker"] == username) {
+    for (int i = 0; i < blkArr.size(); i++) {
+      JsonObject b = blkArr[i];
+      if (b["blocker"].as<String>() == username) {
         JsonObject row = blkArrData.createNestedObject();
         row["username"] = b["blocked"];
       }
@@ -548,12 +821,21 @@ void sendInitialData(uint8_t num, String username) {
     String blkOut;
     serializeJson(blkResp, blkOut);
     webSocket.sendTXT(num, blkOut);
+  } catch (...) {}
+}
 
+void notifyAllActiveClients() {
+  try {
+    Serial.println("[WSS] Notifying all active clients of recent database/presence changes.");
+    for (const auto& c : activeClients) {
+      sendInitialData(c.num, c.username);
+    }
   } catch (...) {}
 }
 
 void savePendingAction(String target, String eventName, String peer, String timestamp = "", String text = "") {
   try {
+    Serial.println("[QUEUE] Storing offline pending event: " + eventName + " for target: " + target);
     String data = readFS("/pending_deletes.json");
     DynamicJsonDocument doc(4096);
     deserializeJson(doc, data);
@@ -575,13 +857,15 @@ void savePendingAction(String target, String eventName, String peer, String time
 
 void sendGroupSystemMessage(String groupId, String msgText) {
   try {
+    Serial.println("[GROUP] Dispatching automated system message: " + msgText);
     String gData = readFS("/groups.json");
     DynamicJsonDocument groupsDoc(4096);
     deserializeJson(groupsDoc, gData);
     JsonArray groupsArr = groupsDoc.as<JsonArray>();
 
-    for (JsonObject g : groupsArr) {
-      if (g["id"] == groupId) {
+    for (int i = 0; i < groupsArr.size(); i++) {
+      JsonObject g = groupsArr[i];
+      if (g["id"].as<String>() == groupId) {
         JsonArray users = g["users"].as<JsonArray>();
         
         DynamicJsonDocument fwdDoc(4096);
@@ -593,33 +877,70 @@ void sendGroupSystemMessage(String groupId, String msgText) {
         data["type"] = "text";
         data["timestamp"] = "Now";
         
+        String rawStr;
+        serializeJson(data, rawStr);
+        if (rawStr.length() <= 120) {
+            sendLoRa("group_message", String(millis()), rawStr);
+        } else {
+            queueMessageChunks("group_message", String(millis()), rawStr);
+        }
+        
         String fwdStr;
         serializeJson(fwdDoc, fwdStr);
-        
-        for (String u : users) {
+        for (int j = 0; j < users.size(); j++) {
           uint8_t targetNum;
-          if (isUserActive(u, targetNum)) {
+          if (isLocalActive(users[j].as<String>(), targetNum)) {
             webSocket.sendTXT(targetNum, fwdStr);
           }
         }
-        
-        String rawStr;
-        serializeJson(data, rawStr);
-        sendLoRa("group_message", String(millis()), rawStr);
         break;
       }
     }
   } catch (...) {}
 }
 
+void requestNextSyncFile() {
+  if (syncQueue.empty()) {
+    isSyncing = false;
+    currentSyncFile = "";
+    syncBuffer = "";
+    expectedChunkIndex = 0;
+    Serial.println("[SYNC_RX] All targeted files synchronized seamlessly. Resuming normal operations.");
+    oledStatus = "Mesh Sync Complete";
+    updateDisplay();
+    return;
+  }
+  
+  isSyncing = true;
+  currentSyncFile = syncQueue[0].fileKey;
+  String targetNode = syncQueue[0].targetNode;
+  lastSyncRequestTime = millis();
+  syncBuffer = "";
+  expectedChunkIndex = 0;
+  
+  DynamicJsonDocument reqDoc(256);
+  reqDoc["fileKey"] = currentSyncFile;
+  reqDoc["targetNode"] = targetNode;
+  String reqOut;
+  serializeJson(reqDoc, reqOut);
+  
+  Serial.println("[SYNC_RX] Requesting priority file update: " + currentSyncFile + " directly from node: " + targetNode);
+  oledStatus = "Syncing " + currentSyncFile + "...";
+  updateDisplay();
+  
+  sendLoRa("req_file", String(millis()), reqOut);
+}
+
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
   try {
     switch (type) {
       case WStype_DISCONNECTED:
+        Serial.println("[WSS] Client disconnected from socket.");
         unregisterActiveClient(num);
         updateDisplay();
         break;
       case WStype_CONNECTED:
+        Serial.println("[WSS] Client connected to socket ID: " + String(num));
         sendInfoEvent(num);
         updateDisplay();
         break;
@@ -627,9 +948,13 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
         {
           DynamicJsonDocument doc(4096);
           DeserializationError err = deserializeJson(doc, payload, length);
-          if (err) return;
+          if (err) {
+             Serial.println("[WSS] Payload JSON parse failure.");
+             return;
+          }
 
           String event = doc["event"] | "";
+          Serial.println("[WSS] Internal App Event Triggered: " + event);
 
           if (event == "test") {
             DynamicJsonDocument resp(256);
@@ -665,14 +990,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
               if (saveUser(username, password, finalToken)) {
                 loginSuccess = true;
                 registerActiveClient(num, username);
-
-                DynamicJsonDocument syncDoc(256);
-                syncDoc["username"] = username;
-                syncDoc["password"] = password;
-                syncDoc["token"] = finalToken;
-                String syncStr;
-                serializeJson(syncDoc, syncStr);
-                sendLoRa("sync_user", String(millis()), syncStr);
+                broadcastFileUpdate("users");
               } else {
                 errMsg = "Internal system storage failure.";
               }
@@ -739,7 +1057,8 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
               if (connArr.isNull()) connArr = connDoc.to<JsonArray>();
 
               bool connExists = false;
-              for (JsonObject c : connArr) {
+              for (int i = 0; i < connArr.size(); i++) {
+                JsonObject c = connArr[i];
                 String u1 = c["user1"]["username"] | "";
                 String u2 = c["user2"]["username"] | "";
                 if ((u1 == initiator && u2 == targetPeer) || (u1 == targetPeer && u2 == initiator)) {
@@ -759,7 +1078,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
                 serializeJson(connDoc, outStr);
                 writeFS("/connections.json", outStr);
 
-                sendLoRa("sync_conn", String(millis()), outStr);
+                broadcastFileUpdate("connections");
               }
 
               DynamicJsonDocument resp(256);
@@ -806,8 +1125,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             DynamicJsonDocument blkDoc(4096);
             deserializeJson(blkDoc, bData);
             JsonArray blkArr = blkDoc.as<JsonArray>();
-            for (JsonObject b : blkArr) {
-              if (b["blocker"] == activeUser) {
+            for (int i = 0; i < blkArr.size(); i++) {
+              JsonObject b = blkArr[i];
+              if (b["blocker"].as<String>() == activeUser) {
                 JsonObject row = blkArrData.createNestedObject();
                 row["username"] = b["blocked"];
               }
@@ -847,13 +1167,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             serializeJson(groupsDoc, outStr);
             writeFS("/groups.json", outStr);
 
-            DynamicJsonDocument syncDoc(1024);
-            syncDoc["id"] = groupId;
-            syncDoc["name"] = groupName;
-            syncDoc["creator"] = creator;
-            String sStr;
-            serializeJson(syncDoc, sStr);
-            sendLoRa("sync_group", String(millis()), sStr);
+            broadcastFileUpdate("groups");
 
             DynamicJsonDocument resp(256);
             resp["event"] = "group_create_response";
@@ -882,14 +1196,15 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             deserializeJson(groupsDoc, gData);
             JsonArray groupsArr = groupsDoc.as<JsonArray>();
 
-            for (JsonObject g : groupsArr) {
-              if (g["id"] == groupId) {
+            for (int i = 0; i < groupsArr.size(); i++) {
+              JsonObject g = groupsArr[i];
+              if (g["id"].as<String>() == groupId) {
                 groupFound = true;
                 foundGroupName = g["name"].as<String>();
                 JsonArray users = g["users"].as<JsonArray>();
                 bool alreadyIn = false;
-                for (String u : users) {
-                  if (u == joinUser) {
+                for (int j = 0; j < users.size(); j++) {
+                  if (users[j].as<String>() == joinUser) {
                     alreadyIn = true;
                     break;
                   }
@@ -905,6 +1220,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
               String outStr;
               serializeJson(groupsDoc, outStr);
               writeFS("/groups.json", outStr);
+              broadcastFileUpdate("groups");
               sendGroupSystemMessage(groupId, joinUser + " joined the group.");
             }
 
@@ -934,8 +1250,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             deserializeJson(groupsDoc, gData);
             JsonArray groupsArr = groupsDoc.as<JsonArray>();
 
-            for (JsonObject g : groupsArr) {
-              if (g["id"] == groupId) {
+            for (int i = 0; i < groupsArr.size(); i++) {
+              JsonObject g = groupsArr[i];
+              if (g["id"].as<String>() == groupId) {
                 DynamicJsonDocument resp(1024);
                 resp["event"] = "group_info_res";
                 JsonObject data = resp.createNestedObject("data");
@@ -948,12 +1265,13 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
                 break;
               }
             }
-          } else if (event == "message" || event == "image" || event == "location") {
+          } else if (event == "message" || event == "location") {
             String sender = doc["data"]["sender"] | "";
             String receiver = doc["data"]["receiver"] | "";
             
             bool bMe, bPeer;
             if (isBlocked(sender, receiver, bMe, bPeer)) {
+                Serial.println("[WSS] Message rejected due to active blockade policy.");
                 DynamicJsonDocument errorResp(256);
                 errorResp["event"] = "send_error";
                 JsonObject errData = errorResp.createNestedObject("data");
@@ -965,13 +1283,11 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             }
 
             uint8_t targetNum;
-            bool isActive = isUserActive(receiver, targetNum);
-
             if (receiver == sender) {
               String echoOutput;
               serializeJson(doc, echoOutput);
               webSocket.sendTXT(num, echoOutput);
-            } else if (isActive) {
+            } else if (isLocalActive(receiver, targetNum)) {
               String msgOutput;
               serializeJson(doc, msgOutput);
               webSocket.sendTXT(targetNum, msgOutput);
@@ -986,7 +1302,18 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             } else {
               String rawStr;
               serializeJson(doc["data"], rawStr);
-              sendLoRa("message", String(millis()), rawStr);
+              String msgType = doc["data"]["type"] | "text";
+              
+              if (msgType.startsWith("img_")) {
+                  Serial.println("[MSG_TX] App-level image protocol (" + String(rawStr.length()) + " bytes). Instant LoRa TX.");
+                  sendLoRa("message", String(millis()), rawStr);
+              } else if (rawStr.length() <= 120) {
+                  Serial.println("[MSG_TX] Short payload (" + String(rawStr.length()) + " bytes). Instant LoRa TX.");
+                  sendLoRa("message", String(millis()), rawStr);
+              } else {
+                  Serial.println("[MSG_TX] Large payload (" + String(rawStr.length()) + " bytes). Passing to msg_chunk framework.");
+                  queueMessageChunks("message", String(millis()), rawStr);
+              }
             }
           } else if (event == "group_message") {
             String groupId = doc["data"]["groupId"] | "";
@@ -1004,21 +1331,21 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             deserializeJson(groupsDoc, gData);
             JsonArray groupsArr = groupsDoc.as<JsonArray>();
 
-            bool routedLocal = false;
-            for (JsonObject g : groupsArr) {
-              if (g["id"] == groupId) {
+            for (int i = 0; i < groupsArr.size(); i++) {
+              JsonObject g = groupsArr[i];
+              if (g["id"].as<String>() == groupId) {
                 JsonArray users = g["users"].as<JsonArray>();
-                for (String u : users) {
-                  if (u != sender) {
+                for (int j = 0; j < users.size(); j++) {
+                  if (users[j].as<String>() != sender) {
                     uint8_t targetNum;
-                    if (isUserActive(u, targetNum)) {
+                    if (isLocalActive(users[j].as<String>(), targetNum)) {
+                      Serial.println("[ROUTING] Mapping group multicast logic toward active client socket.");
                       DynamicJsonDocument fwdDoc(4096);
                       fwdDoc["event"] = "group_message";
                       fwdDoc["data"] = doc["data"];
                       String fwdStr;
                       serializeJson(fwdDoc, fwdStr);
                       webSocket.sendTXT(targetNum, fwdStr);
-                      routedLocal = true;
                     }
                   }
                 }
@@ -1028,22 +1355,29 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
 
             String rawStr;
             serializeJson(doc["data"], rawStr);
-            sendLoRa("group_message", String(millis()), rawStr);
+            String msgType = doc["data"]["type"] | "text";
+            
+            if (msgType.startsWith("img_")) {
+                Serial.println("[MSG_TX] App-level group image protocol (" + String(rawStr.length()) + " bytes). Instant LoRa TX.");
+                sendLoRa("group_message", String(millis()), rawStr);
+            } else if (rawStr.length() <= 120) {
+                Serial.println("[MSG_TX] Short group message (" + String(rawStr.length()) + " bytes). Instant LoRa TX.");
+                sendLoRa("group_message", String(millis()), rawStr);
+            } else {
+                Serial.println("[MSG_TX] Large group message (" + String(rawStr.length()) + " bytes). Passing to msg_chunk framework.");
+                queueMessageChunks("group_message", String(millis()), rawStr);
+            }
           } else if (event == "block_user" || event == "unblock_user") {
             String target = doc["data"]["target"] | "";
             String sender = doc["data"]["sender"] | "";
             handleBlockStatus(sender, target, event == "block_user");
-            
-            String rawStr;
-            serializeJson(doc["data"], rawStr);
-            sendLoRa(event, String(millis()), rawStr);
             sendInitialData(num, sender);
           } else if (event == "delete_chat_both") {
             String target = doc["data"]["target"] | "";
             String sender = doc["data"]["sender"] | "";
             
             uint8_t targetNum;
-            if (isUserActive(target, targetNum)) {
+            if (isLocalActive(target, targetNum)) {
               DynamicJsonDocument fwdDoc(256);
               fwdDoc["event"] = "delete_chat";
               JsonObject dData = fwdDoc.createNestedObject("data");
@@ -1063,9 +1397,8 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             String sender = doc["data"]["sender"] | "";
             String timestamp = doc["data"]["timestamp"] | "";
             String text = doc["data"]["text"] | "";
-            
             uint8_t targetNum;
-            if (isUserActive(target, targetNum)) {
+            if (isLocalActive(target, targetNum)) {
               DynamicJsonDocument fwdDoc(512);
               fwdDoc["event"] = "delete_message_both";
               fwdDoc["data"] = doc["data"];
@@ -1082,19 +1415,20 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
           } else if (event == "delete_group_message_both") {
             String groupId = doc["data"]["groupId"] | "";
             String sender = doc["data"]["sender"] | "";
-            
+
             String gData = readFS("/groups.json");
             DynamicJsonDocument groupsDoc(4096);
             deserializeJson(groupsDoc, gData);
             JsonArray groupsArr = groupsDoc.as<JsonArray>();
 
-            for (JsonObject g : groupsArr) {
-              if (g["id"] == groupId) {
+            for (int i = 0; i < groupsArr.size(); i++) {
+              JsonObject g = groupsArr[i];
+              if (g["id"].as<String>() == groupId) {
                 JsonArray users = g["users"].as<JsonArray>();
-                for (String u : users) {
-                  if (u != sender) {
+                for (int j = 0; j < users.size(); j++) {
+                  if (users[j].as<String>() != sender) {
                     uint8_t targetNum;
-                    if (isUserActive(u, targetNum)) {
+                    if (isLocalActive(users[j].as<String>(), targetNum)) {
                       DynamicJsonDocument fwdDoc(512);
                       fwdDoc["event"] = "delete_group_message_both";
                       fwdDoc["data"] = doc["data"];
@@ -1111,56 +1445,68 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length)
             String rawStr;
             serializeJson(doc["data"], rawStr);
             sendLoRa("delete_group_message_both", String(millis()), rawStr);
-          } else if (event == "group_leave" || event == "group_remove_user" || event == "group_add_admin" || event == "group_remove_admin") {
-            String groupId = doc["data"]["groupId"] | "";
-            String target = (event == "group_leave") ? (doc["data"]["sender"] | "") : (doc["data"]["target"] | "");
-            
-            String gData = readFS("/groups.json");
-            DynamicJsonDocument groupsDoc(4096);
-            deserializeJson(groupsDoc, gData);
-            JsonArray groupsArr = groupsDoc.as<JsonArray>();
-            
-            bool changed = false;
-            for (JsonObject g : groupsArr) {
-              if (g["id"] == groupId) {
-                JsonArray users = g["users"].as<JsonArray>();
-                JsonArray admins = g["admins"].as<JsonArray>();
-                
-                if (event == "group_leave" || event == "group_remove_user") {
-                  for (int i=0; i<users.size(); i++) {
-                      if (users[i] == target) { users.remove(i); break; }
-                  }
-                  for (int i=0; i<admins.size(); i++) {
-                      if (admins[i] == target) { admins.remove(i); break; }
-                  }
-                  changed = true;
-                } else if (event == "group_add_admin") {
-                  bool found = false;
-                  for (String a : admins) { if (a == target) found = true; }
-                  if (!found) { admins.add(target); changed = true; }
-                } else if (event == "group_remove_admin") {
-                  for (int i=0; i<admins.size(); i++) {
-                      if (admins[i] == target) { admins.remove(i); changed = true; break; }
-                  }
+          } else if (event == "app_version_req") {
+            if (sdAvailable && currentAppVersion > 0) {
+              DynamicJsonDocument resDoc(256);
+              resDoc["version"] = currentAppVersion;
+              String raw;
+              serializeJson(resDoc, raw);
+              sendLoRa("app_version_res", String(millis()), raw);
+            }
+          } else if (event == "app_version_res") {
+            float remoteVer = doc["data"]["version"].as<float>();
+            if (remoteVer > currentAppVersion) {
+              oledStatus = "New App Ver: " + String(remoteVer);
+              updateDisplay();
+            }
+          } else if (event == "app_transfer_req") {
+            if (sdAvailable && SD.exists("/app/app-release.apk")) {
+              File file = SD.open("/app/app-release.apk", "r");
+              if (file) {
+                uint8_t buf[64];
+                int bytesRead = file.read(buf, sizeof(buf));
+                file.close();
+                if (bytesRead > 0) {
+                  unsigned char out[128];
+                  size_t out_len;
+                  mbedtls_base64_encode(out, sizeof(out), &out_len, buf, bytesRead);
+                  DynamicJsonDocument resDoc(1024);
+                  resDoc["chunk"] = 0;
+                  resDoc["data"] = String((char*)out);
+                  String outStr;
+                  serializeJson(resDoc, outStr);
+                  sendLoRa("app_transfer_res", String(millis()), outStr);
                 }
-                break;
               }
             }
-            
-            if (changed) {
-              String outStr;
-              serializeJson(groupsDoc, outStr);
-              writeFS("/groups.json", outStr);
-              
-              String rawStr;
-              serializeJson(doc["data"], rawStr);
-              sendLoRa(event, String(millis()), rawStr);
+          } else if (event == "app_transfer_res") {
+            if (isDownloadingApp) {
+              int chunk = doc["data"]["chunk"] | 0;
+              oledStatus = "APK DL Chunk: " + String(chunk);
+              updateDisplay();
             }
           }
         }
         break;
     }
-  } catch (...) {}
+  } catch (...) {
+      Serial.println("[WSS] Handled unexpected exception processing socket message.");
+  }
+}
+
+void checkRemoteUsers() {
+  unsigned long now = millis();
+  auto it = remoteActiveUsers.begin();
+  bool changed = false;
+  while (it != remoteActiveUsers.end()) {
+    if (now - it->lastSeen > 45000) {
+      it = remoteActiveUsers.erase(it);
+      changed = true;
+    } else {
+      ++it;
+    }
+  }
+  if (changed) notifyAllActiveClients();
 }
 
 void checkNeighbors() {
@@ -1170,6 +1516,7 @@ void checkNeighbors() {
     bool changed = false;
     while (it != neighbors.end()) {
       if (now - it->lastSeen > 30000) {
+        Serial.println("[LORA_NET] Device went offline. Purging neighbor: " + it->nodeName);
         it = neighbors.erase(it);
         changed = true;
       } else {
@@ -1182,6 +1529,7 @@ void checkNeighbors() {
 
 void broadcastPing() {
   try {
+    Serial.println("[LORA_TX] Broadcasting network ping.");
     DynamicJsonDocument doc(256);
     doc["type"] = "ping";
     doc["node"] = nodeName;
@@ -1196,15 +1544,23 @@ void broadcastPing() {
 void handleIncomingLoRaPacket(int packetSize) {
   try {
     String packet = "";
+    packet.reserve(packetSize + 1);
     while (LoRa.available()) {
       packet += (char)LoRa.read();
     }
 
     DynamicJsonDocument doc(4096);
     DeserializationError err = deserializeJson(doc, packet);
-    if (err) return;
+    if (err) {
+      Serial.println("[LORA_RX] Failed to parse JSON envelope. Discarding block.");
+      return;
+    }
 
     String type = doc["type"] | "";
+    
+    if (type != "sync_chunk" && type != "msg_chunk") {
+         Serial.println("[LORA_RX] Envelope identified as: " + type);
+    }
 
     if (type == "ping") {
       String fromNode = doc["node"] | "";
@@ -1219,13 +1575,267 @@ void handleIncomingLoRaPacket(int packetSize) {
         }
       }
       if (!found) {
+        Serial.println("[LORA_NET] Detected new node link: " + fromNode);
         Neighbor newN;
         newN.nodeName = fromNode;
         newN.rssi = currentRssi;
         newN.lastSeen = millis();
         neighbors.push_back(newN);
+        if (!isReceivingStream() && txQueue.empty()) {
+            requestVersionsFromClosestNeighbor();
+        }
       }
       updateDisplay();
+    } else if (type == "presence") {
+      String saltedData = doc["data"] | "";
+      String rawData = removeSalt(saltedData);
+      DynamicJsonDocument pDoc(512);
+      DeserializationError pErr = deserializeJson(pDoc, rawData);
+      if (!pErr) {
+        JsonArray arr = pDoc["users"].as<JsonArray>();
+        bool changed = false;
+        for (int i = 0; i < arr.size(); i++) {
+            String u = arr[i].as<String>();
+            bool found = false;
+            for (auto& r : remoteActiveUsers) {
+                if (r.username == u) {
+                    if (millis() - r.lastSeen > 40000) changed = true;
+                    r.lastSeen = millis();
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                RemoteUser ru;
+                ru.username = u;
+                ru.lastSeen = millis();
+                remoteActiveUsers.push_back(ru);
+                changed = true;
+            }
+        }
+        if (changed) notifyAllActiveClients();
+      }
+    } else if (type == "req_version") {
+      String saltedData = doc["data"] | "";
+      String rawData = removeSalt(saltedData);
+      DynamicJsonDocument reqDoc(256);
+      deserializeJson(reqDoc, rawData);
+      String target = reqDoc["targetNode"].as<String>();
+      if (target == nodeName) {
+         Serial.println("[SYNC_RX] Targeted version request received. Replying with ledger.");
+         sendLocalVersions();
+      }
+    } else if (type == "version_check") {
+      String saltedData = doc["data"] | "";
+      String rawData = removeSalt(saltedData);
+      DynamicJsonDocument wrapDoc(1024);
+      deserializeJson(wrapDoc, rawData);
+      
+      String remoteNode = wrapDoc["node"].as<String>();
+      String vJson = wrapDoc["versions"].as<String>();
+      DynamicJsonDocument remoteVersions(512);
+      deserializeJson(remoteVersions, vJson);
+      
+      String localVData = readFS("/data_versions.json");
+      DynamicJsonDocument localVersions(512);
+      deserializeJson(localVersions, localVData);
+
+      Serial.println("[SYNC] Processing version ledger from node: " + remoteNode);
+      String keys[] = {"users", "connections", "groups", "block_list"};
+      for (String k : keys) {
+        int locV = localVersions[k] | 0;
+        int remV = remoteVersions[k] | 0;
+        Serial.println("[SYNC] Record: " + k + " | Local: " + String(locV) + " | Remote: " + String(remV));
+        
+        if (locV < remV) {
+          Serial.println("[SYNC] Outdated record identified. Queueing strict request for: " + k + " from node: " + remoteNode);
+          bool inQueue = false;
+          for (auto& task : syncQueue) {
+              if (task.fileKey == k) { inQueue = true; break; }
+          }
+          if (!inQueue) {
+             SyncTask st;
+             st.fileKey = k;
+             st.targetNode = remoteNode;
+             syncQueue.push_back(st);
+          }
+        }
+      }
+      
+      if (!syncQueue.empty() && !isSyncing) {
+        Serial.println("[SYNC] Commencing synchronized file requests sequence.");
+        requestNextSyncFile();
+      }
+    } else if (type == "req_file") {
+      String saltedData = doc["data"] | "";
+      String rawData = removeSalt(saltedData);
+      DynamicJsonDocument reqDoc(256);
+      deserializeJson(reqDoc, rawData);
+      String k = reqDoc["fileKey"].as<String>();
+      String tNode = reqDoc["targetNode"].as<String>();
+      
+      if (tNode == nodeName) {
+         Serial.println("[SYNC_TX] Direct file request received and approved for sequence: " + k);
+         broadcastFileUpdateWithoutIncrement(k);
+      }
+    } else if (type == "sync_chunk") {
+      lastChunkRxTime = millis();
+      String saltedData = doc["data"] | "";
+      String rawData = removeSalt(saltedData);
+      DynamicJsonDocument fileDoc(1024);
+      DeserializationError fErr = deserializeJson(fileDoc, rawData);
+      
+      if (fErr) {
+         Serial.println("[SYNC_RX] Severe parsing disruption in sync chunk stream.");
+      } else {
+          String fileKey = fileDoc["fileKey"].as<String>();
+          int remoteV = fileDoc["version"].as<int>();
+          int chunk = fileDoc["chunk"].as<int>();
+          int total = fileDoc["total"].as<int>();
+          String chunkData = fileDoc["data"].as<String>();
+
+          Serial.println("[SYNC_RX] Received Base64 chunk " + String(chunk+1) + "/" + String(total) + " for " + fileKey);
+
+          if (chunk == 0) {
+              syncBuffer = chunkData;
+              syncBuffer.reserve(total * 48);
+              expectedChunkIndex = 1;
+          } else if (chunk == expectedChunkIndex) {
+              syncBuffer += chunkData;
+              expectedChunkIndex++;
+          } else {
+              Serial.println("[SYNC_RX] Chunk sequence mismatch! Expected: " + String(expectedChunkIndex) + ", Got: " + String(chunk));
+              return;
+          }
+
+          if (chunk == total - 1) {
+              int localV = getFileVersion(fileKey);
+              if (remoteV > localV) {
+                String decodedContent = base64Decode(syncBuffer);
+                if (decodedContent.length() > 0) {
+                    Serial.println("[SYNC_RX] Base64 reassembled and decoded successfully: " + fileKey + " to v" + String(remoteV));
+                    writeFS("/" + fileKey + ".json", decodedContent);
+                    setFileVersion(fileKey, remoteV);
+                    oledStatus = "Sync " + fileKey + " v" + String(remoteV);
+                    updateDisplay();
+                    notifyAllActiveClients();
+                } else {
+                    Serial.println("[SYNC_RX] Base64 decoding process failed on the reassembled buffer.");
+                }
+              }
+              
+              if (isSyncing && currentSyncFile == fileKey) {
+                  Serial.println("[SYNC_RX] Queue sequence validated. Transitioning to next request marker.");
+                  if (!syncQueue.empty()) syncQueue.erase(syncQueue.begin());
+                  requestNextSyncFile();
+              }
+          }
+      }
+    } else if (type == "msg_chunk") {
+      lastChunkRxTime = millis();
+      String saltedData = doc["data"] | "";
+      String rawData = removeSalt(saltedData);
+      DynamicJsonDocument msgDoc(1024);
+      DeserializationError fErr = deserializeJson(msgDoc, rawData);
+      
+      if (fErr) {
+         Serial.println("[MSG_RX] Severe parsing disruption in msg chunk stream.");
+      } else {
+          String reqId = msgDoc["reqId"].as<String>();
+          String msgType = msgDoc["msgType"].as<String>();
+          int chunk = msgDoc["chunk"].as<int>();
+          int total = msgDoc["total"].as<int>();
+          String chunkData = msgDoc["data"].as<String>();
+
+          Serial.println("[MSG_RX] Received Base64 slice " + String(chunk+1) + "/" + String(total) + " for message ID: " + reqId);
+
+          if (chunk == 0) {
+              msgBuffer = chunkData;
+              msgBuffer.reserve(total * 48);
+              expectedMsgChunkIndex = 1;
+              currentMsgReqId = reqId;
+          } else if (chunk == expectedMsgChunkIndex && reqId == currentMsgReqId) {
+              msgBuffer += chunkData;
+              expectedMsgChunkIndex++;
+          } else {
+              Serial.println("[MSG_RX] Slice sequence mismatch! Expected: " + String(expectedMsgChunkIndex) + ", Got: " + String(chunk));
+              return;
+          }
+
+          if (chunk == total - 1) {
+              String decodedContent = base64Decode(msgBuffer);
+              msgBuffer = "";
+              if (decodedContent.length() > 0) {
+                  Serial.println("[MSG_RX] Message reassembled and decoded successfully. Payload size: " + String(decodedContent.length()));
+                  
+                  DynamicJsonDocument innerDoc(8192);
+                  DeserializationError jsonErr = deserializeJson(innerDoc, decodedContent);
+
+                  if (!jsonErr) {
+                      if (msgType == "message") {
+                          String receiver = innerDoc["receiver"] | "";
+                          String sender = innerDoc["sender"] | "";
+                          
+                          bool bMe, bPeer;
+                          if (!isBlocked(sender, receiver, bMe, bPeer)) {
+                            uint8_t targetNum;
+                            if (isLocalActive(receiver, targetNum)) {
+                              Serial.println("[ROUTING] Direct internal delivery executed to client socket.");
+                              DynamicJsonDocument fwdDoc(8192);
+                              fwdDoc["event"] = "message";
+                              fwdDoc["data"] = innerDoc;
+                              String fwdStr;
+                              serializeJson(fwdDoc, fwdStr);
+                              webSocket.sendTXT(targetNum, fwdStr);
+
+                              DynamicJsonDocument delDoc(256);
+                              delDoc["receiver"] = receiver;
+                              String delRaw;
+                              serializeJson(delDoc, delRaw);
+                              sendLoRa("msg_delivered", reqId, delRaw);
+                            }
+                          } else {
+                             Serial.println("[ROUTING] Access denied. Packet discarded due to block rule.");
+                          }
+                      } else if (msgType == "group_message") {
+                          String groupId = innerDoc["groupId"] | "";
+                          String sender = innerDoc["sender"] | "";
+
+                          String gData = readFS("/groups.json");
+                          DynamicJsonDocument groupsDoc(4096);
+                          deserializeJson(groupsDoc, gData);
+                          JsonArray groupsArr = groupsDoc.as<JsonArray>();
+
+                          for (int i = 0; i < groupsArr.size(); i++) {
+                            JsonObject g = groupsArr[i];
+                            if (g["id"].as<String>() == groupId) {
+                              JsonArray users = g["users"].as<JsonArray>();
+                              for (int j = 0; j < users.size(); j++) {
+                                if (users[j].as<String>() != sender) {
+                                  uint8_t targetNum;
+                                  if (isLocalActive(users[j].as<String>(), targetNum)) {
+                                    Serial.println("[ROUTING] Mapping group multicast logic toward active client socket.");
+                                    DynamicJsonDocument fwdDoc(8192);
+                                    fwdDoc["event"] = "group_message";
+                                    fwdDoc["data"] = innerDoc;
+                                    String fwdStr;
+                                    serializeJson(fwdDoc, fwdStr);
+                                    webSocket.sendTXT(targetNum, fwdStr);
+                                  }
+                                }
+                              }
+                              break;
+                            }
+                          }
+                      }
+                  } else {
+                      Serial.println("[MSG_RX] Reassembled message JSON parsing failed!");
+                  }
+              } else {
+                  Serial.println("[MSG_RX] Base64 decoding process failed on the reassembled message buffer.");
+              }
+          }
+      }
     } else {
       String reqId = doc["req_id"] | "";
       String saltedData = doc["data"] | "";
@@ -1235,48 +1845,15 @@ void handleIncomingLoRaPacket(int packetSize) {
         DynamicJsonDocument innerDoc(4096);
         deserializeJson(innerDoc, rawData);
 
-        if (type == "sync_user") {
-          saveUser(innerDoc["username"].as<String>(), innerDoc["password"].as<String>(), innerDoc["token"].as<String>());
-        } else if (type == "sync_conn") {
-          writeFS("/connections.json", rawData);
-        } else if (type == "sync_group") {
-          String groupId = innerDoc["id"].as<String>();
-          String groupName = innerDoc["name"].as<String>();
-          String creator = innerDoc["creator"].as<String>();
-
-          String gData = readFS("/groups.json");
-          DynamicJsonDocument groupsDoc(4096);
-          deserializeJson(groupsDoc, gData);
-          JsonArray groupsArr = groupsDoc.as<JsonArray>();
-          if (groupsArr.isNull()) groupsArr = groupsDoc.to<JsonArray>();
-
-          bool exists = false;
-          for (JsonObject g : groupsArr) {
-            if (g["id"] == groupId) {
-              exists = true;
-              break;
-            }
-          }
-          if (!exists) {
-            JsonObject newGroup = groupsArr.createNestedObject();
-            newGroup["id"] = groupId;
-            newGroup["name"] = groupName;
-            JsonArray adminsArr = newGroup.createNestedArray("admins");
-            adminsArr.add(creator);
-            JsonArray usersArr = newGroup.createNestedArray("users");
-            usersArr.add(creator);
-            String outStr;
-            serializeJson(groupsDoc, outStr);
-            writeFS("/groups.json", outStr);
-          }
-        } else if (type == "message") {
+        if (type == "message") {
           String receiver = innerDoc["receiver"] | "";
           String sender = innerDoc["sender"] | "";
           
           bool bMe, bPeer;
           if (!isBlocked(sender, receiver, bMe, bPeer)) {
             uint8_t targetNum;
-            if (isUserActive(receiver, targetNum)) {
+            if (isLocalActive(receiver, targetNum)) {
+              Serial.println("[ROUTING] Direct internal delivery executed to client socket.");
               DynamicJsonDocument fwdDoc(4096);
               fwdDoc["event"] = "message";
               fwdDoc["data"] = innerDoc;
@@ -1290,11 +1867,13 @@ void handleIncomingLoRaPacket(int packetSize) {
               serializeJson(delDoc, delRaw);
               sendLoRa("msg_delivered", reqId, delRaw);
             }
+          } else {
+             Serial.println("[ROUTING] Access denied. Packet discarded due to block rule.");
           }
         } else if (type == "msg_delivered") {
           String sender = innerDoc["receiver"] | "";
           uint8_t targetNum;
-          if (isUserActive(sender, targetNum)) {
+          if (isLocalActive(sender, targetNum)) {
             DynamicJsonDocument fwdDoc(256);
             fwdDoc["event"] = "msg_delivered";
             fwdDoc["data"] = innerDoc;
@@ -1311,13 +1890,15 @@ void handleIncomingLoRaPacket(int packetSize) {
           deserializeJson(groupsDoc, gData);
           JsonArray groupsArr = groupsDoc.as<JsonArray>();
 
-          for (JsonObject g : groupsArr) {
-            if (g["id"] == groupId) {
+          for (int i = 0; i < groupsArr.size(); i++) {
+            JsonObject g = groupsArr[i];
+            if (g["id"].as<String>() == groupId) {
               JsonArray users = g["users"].as<JsonArray>();
-              for (String u : users) {
-                if (u != sender) {
+              for (int j = 0; j < users.size(); j++) {
+                if (users[j].as<String>() != sender) {
                   uint8_t targetNum;
-                  if (isUserActive(u, targetNum)) {
+                  if (isLocalActive(users[j].as<String>(), targetNum)) {
+                    Serial.println("[ROUTING] Mapping group multicast logic toward active client socket.");
                     DynamicJsonDocument fwdDoc(4096);
                     fwdDoc["event"] = "group_message";
                     fwdDoc["data"] = innerDoc;
@@ -1330,15 +1911,11 @@ void handleIncomingLoRaPacket(int packetSize) {
               break;
             }
           }
-        } else if (type == "block_user" || type == "unblock_user") {
-          String target = innerDoc["target"] | "";
-          String sender = innerDoc["sender"] | "";
-          handleBlockStatus(sender, target, type == "block_user");
         } else if (type == "delete_chat_both") {
           String target = innerDoc["target"] | "";
           String sender = innerDoc["sender"] | "";
           uint8_t targetNum;
-          if (isUserActive(target, targetNum)) {
+          if (isLocalActive(target, targetNum)) {
             DynamicJsonDocument fwdDoc(256);
             fwdDoc["event"] = "delete_chat";
             JsonObject dData = fwdDoc.createNestedObject("data");
@@ -1352,16 +1929,18 @@ void handleIncomingLoRaPacket(int packetSize) {
         } else if (type == "delete_message_both") {
           String target = innerDoc["target"] | "";
           String sender = innerDoc["sender"] | "";
+          String timestamp = innerDoc["timestamp"] | "";
+          String text = innerDoc["text"] | "";
           uint8_t targetNum;
-          if (isUserActive(target, targetNum)) {
+          if (isLocalActive(target, targetNum)) {
             DynamicJsonDocument fwdDoc(512);
             fwdDoc["event"] = "delete_message_both";
-            fwdDoc["data"] = innerDoc;
+            fwdDoc["data"] = doc["data"];
             String fwdStr;
             serializeJson(fwdDoc, fwdStr);
             webSocket.sendTXT(targetNum, fwdStr);
           } else {
-            savePendingAction(target, "delete_message_both", sender, innerDoc["timestamp"] | "", innerDoc["text"] | "");
+            savePendingAction(target, "delete_message_both", sender, timestamp, text);
           }
         } else if (type == "delete_group_message_both") {
           String groupId = innerDoc["groupId"] | "";
@@ -1372,16 +1951,17 @@ void handleIncomingLoRaPacket(int packetSize) {
           deserializeJson(groupsDoc, gData);
           JsonArray groupsArr = groupsDoc.as<JsonArray>();
 
-          for (JsonObject g : groupsArr) {
-            if (g["id"] == groupId) {
+          for (int i = 0; i < groupsArr.size(); i++) {
+            JsonObject g = groupsArr[i];
+            if (g["id"].as<String>() == groupId) {
               JsonArray users = g["users"].as<JsonArray>();
-              for (String u : users) {
-                if (u != sender) {
+              for (int j = 0; j < users.size(); j++) {
+                if (users[j].as<String>() != sender) {
                   uint8_t targetNum;
-                  if (isUserActive(u, targetNum)) {
+                  if (isLocalActive(users[j].as<String>(), targetNum)) {
                     DynamicJsonDocument fwdDoc(512);
                     fwdDoc["event"] = "delete_group_message_both";
-                    fwdDoc["data"] = innerDoc;
+                    fwdDoc["data"] = doc["data"];
                     String fwdStr;
                     serializeJson(fwdDoc, fwdStr);
                     webSocket.sendTXT(targetNum, fwdStr);
@@ -1390,47 +1970,6 @@ void handleIncomingLoRaPacket(int packetSize) {
               }
               break;
             }
-          }
-        } else if (type == "group_leave" || type == "group_remove_user" || type == "group_add_admin" || type == "group_remove_admin") {
-          String groupId = innerDoc["groupId"] | "";
-          String target = (type == "group_leave") ? (innerDoc["sender"] | "") : (innerDoc["target"] | "");
-            
-          String gData = readFS("/groups.json");
-          DynamicJsonDocument groupsDoc(4096);
-          deserializeJson(groupsDoc, gData);
-          JsonArray groupsArr = groupsDoc.as<JsonArray>();
-            
-          bool changed = false;
-          for (JsonObject g : groupsArr) {
-            if (g["id"] == groupId) {
-              JsonArray users = g["users"].as<JsonArray>();
-              JsonArray admins = g["admins"].as<JsonArray>();
-                
-              if (type == "group_leave" || type == "group_remove_user") {
-                for (int i=0; i<users.size(); i++) {
-                    if (users[i] == target) { users.remove(i); break; }
-                }
-                for (int i=0; i<admins.size(); i++) {
-                    if (admins[i] == target) { admins.remove(i); break; }
-                }
-                changed = true;
-              } else if (type == "group_add_admin") {
-                bool found = false;
-                for (String a : admins) { if (a == target) found = true; }
-                if (!found) { admins.add(target); changed = true; }
-              } else if (type == "group_remove_admin") {
-                for (int i=0; i<admins.size(); i++) {
-                    if (admins[i] == target) { admins.remove(i); changed = true; break; }
-                }
-              }
-              break;
-            }
-          }
-            
-          if (changed) {
-            String outStr;
-            serializeJson(groupsDoc, outStr);
-            writeFS("/groups.json", outStr);
           }
         } else if (type == "app_version_req") {
           if (sdAvailable && currentAppVersion > 0) {
@@ -1462,23 +2001,26 @@ void handleIncomingLoRaPacket(int packetSize) {
                 resDoc["data"] = String((char*)out);
                 String outStr;
                 serializeJson(resDoc, outStr);
-                sendLoRa("app_transfer_res", reqId, outStr);
+                sendLoRa("app_transfer_res", String(millis()), outStr);
               }
             }
           }
         } else if (type == "app_transfer_res") {
           if (isDownloadingApp) {
-            int chunk = innerDoc["chunk"] | 0;
+            int chunk = doc["data"]["chunk"] | 0;
             oledStatus = "APK DL Chunk: " + String(chunk);
             updateDisplay();
           }
         }
       }
     }
-  } catch (...) {}
+  } catch (...) {
+      Serial.println("[LORA_RX] General exception during packet sequence extraction.");
+  }
 }
 
 void startWebServer(){
+    Serial.println("[WIFI_WEB] Initializing Web Server HTTP Endpoints.");
     webServer.on("/", HTTP_GET, []() {
       String html = "<html><body style='font-family:sans-serif; padding:20px;'>";
       html += "<h1>PIGEON Node Configuration</h1>";
@@ -1508,6 +2050,7 @@ void startWebServer(){
         repeaterPass = webServer.arg("pass");
         saveWifiConfig();
         webServer.send(200, "text/html", "<h1>WiFi Updated! Rebooting...</h1>");
+        Serial.println("[WIFI_WEB] Repeater configuration updated. Restarting node sequence.");
         delay(1000);
         ESP.restart();
       } else {
@@ -1520,6 +2063,7 @@ void startWebServer(){
         nodeName = webServer.arg("node");
         saveWifiConfig();
         webServer.send(200, "text/html", "<h1>Node Name Updated! Rebooting...</h1>");
+        Serial.println("[WIFI_WEB] Node Name updated. Restarting node sequence.");
         delay(1000);
         ESP.restart();
       } else {
@@ -1546,22 +2090,51 @@ void startWebServer(){
 
 void setup() {
   try {
+    Serial.begin(115200);
+    delay(1000);
+    Serial.println("\n\n=== PIGEON NODE BOOTING SEQUENCE ===");
+
     SPIFFS.begin(true);
+    Serial.println("[SYS] SPIFFS local storage mounted.");
     loadWifiConfig();
+    
+    String vData = readFS("/data_versions.json");
+    if (vData == "{}" || vData == "") {
+      Serial.println("[SYS] Bootstrapping primary data_versions.json file parameters.");
+      DynamicJsonDocument vDoc(512);
+      vDoc["users"] = 0;
+      vDoc["connections"] = 0;
+      vDoc["groups"] = 0;
+      vDoc["block_list"] = 0;
+      String out;
+      serializeJson(vDoc, out);
+      writeFS("/data_versions.json", out);
+      vData = out;
+    }
+
+    Serial.println("[SYS] --- FIRMWARE SYNC VERSION LEDGER ---");
+    Serial.println(vData);
+    Serial.println("[SYS] ------------------------------------");
     
     Wire.begin(SDA_PIN, SCL_PIN);
     if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
       display.clearDisplay();
       display.display();
+      Serial.println("[SYS] OLED Diagnostic Display configured.");
     }
 
     WiFi.mode(WIFI_AP_STA);
     nodePassword = generatePassword(nodeName);
+    Serial.println("[WIFI] Switching core state to AP_STA Mode.");
+    Serial.println("[WIFI] Node SoftAP Creds >> ID: " + nodeName + " PASS: " + nodePassword);
     WiFi.softAP(nodeName.c_str(), nodePassword.c_str());
+    
+    Serial.println("[WIFI] Requesting upstream link configuration: " + repeaterSSID);
     WiFi.begin(repeaterSSID.c_str(), repeaterPass.c_str());
 
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
     if (netif) {
+        Serial.println("[WIFI] Applying NAPT packet modifications for DNS transparency.");
         esp_netif_dhcps_stop(netif);
         esp_netif_napt_enable(netif);
         esp_netif_dns_info_t dns;
@@ -1576,6 +2149,9 @@ void setup() {
     sdSPI.begin(19, 5, 18, 21);
     if (SD.begin(21, sdSPI)) {
       sdAvailable = true;
+      Serial.println("[SYS] SD Card external memory Mounted.");
+    } else {
+      Serial.println("[SYS] Warning: No valid SD Card signature found.");
     }
 
     loraSPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
@@ -1588,24 +2164,27 @@ void setup() {
       LoRa.setSignalBandwidth(125E3);
       LoRa.setCodingRate4(5);
       LoRa.enableCrc();
+      Serial.println("[LORA] Core Transceiver Radio link activated.");
     } else {
+      Serial.println("[LORA] Radio chip hardware failure recorded.");
       oledStatus = "LORA INIT FAIL";
       updateDisplay();
-      while (1)
-        ;
+      while (1);
     }
 
     webSocket.begin();
     webSocket.onEvent(webSocketEvent);
+    Serial.println("[WSS] WebSockets binding on local port 81.");
 
     startWebServer();
 
     oledStatus = "System Ready";
     updateDisplay();
-
     handleAppVersionCheck();
 
-  } catch (...) {}
+  } catch (...) {
+      Serial.println("[SYS] Fatal boot exception logged to crash dump.");
+  }
 }
 
 void loop() {
@@ -1618,17 +2197,73 @@ void loop() {
       handleIncomingLoRaPacket(packetSize);
     }
 
-    if (millis() - lastBeaconTime > 10000) {
-      broadcastPing();
-      lastBeaconTime = millis();
+    if (!txQueue.empty()) {
+        if (millis() - lastTxTime > 300) {
+          TxTask& t = txQueue[0];
+          String chunkData = t.fullBase64Data.substring(currentChunkIdx * 48, min((currentChunkIdx + 1) * 48, (int)t.fullBase64Data.length()));
+          
+          DynamicJsonDocument doc(1024);
+          if (t.type == "sync") {
+              doc["fileKey"] = t.fileKey;
+              doc["version"] = t.version;
+              doc["chunk"] = currentChunkIdx;
+              doc["total"] = t.totalChunks;
+              doc["data"] = chunkData;
+              String out;
+              serializeJson(doc, out);
+              sendLoRa("sync_chunk", String(millis()), out);
+          } else if (t.type == "msg") {
+              doc["reqId"] = t.fileKey;
+              doc["msgType"] = t.msgType;
+              doc["chunk"] = currentChunkIdx;
+              doc["total"] = t.totalChunks;
+              doc["data"] = chunkData;
+              String out;
+              serializeJson(doc, out);
+              sendLoRa("msg_chunk", String(millis()), out);
+          }
+          
+          currentChunkIdx++;
+          if (currentChunkIdx >= t.totalChunks) {
+              txQueue.erase(txQueue.begin());
+              currentChunkIdx = 0;
+          }
+          lastTxTime = millis();
+        }
+    } else if (isSyncing) {
+        if (millis() - lastSyncRequestTime > 15000) {
+             Serial.println("[SYNC_TIMEOUT] Time boundary exceeded while retrieving " + currentSyncFile + ". Retrying...");
+             requestNextSyncFile();
+        }
+    } else if (!isReceivingStream()) {
+        if (millis() - lastBeaconTime > 10000) {
+          broadcastPing();
+          lastBeaconTime = millis();
+        }
+
+        if (millis() - lastPresenceTime > 25000) {
+          if (!activeClients.empty()) {
+            broadcastPresence();
+          }
+          lastPresenceTime = millis();
+        }
+
+        if (millis() - lastVersionCheckTime > 60000) {
+          requestVersionsFromClosestNeighbor();
+          lastVersionCheckTime = millis();
+        }
     }
 
     checkNeighbors();
+    checkRemoteUsers();
 
     int currentClients = WiFi.softAPgetStationNum();
     if (currentClients != prevClientsCount) {
+      Serial.println("[WIFI] Active gateway endpoints verified: " + String(currentClients));
       prevClientsCount = currentClients;
       updateDisplay();
     }
-  } catch (...) {}
+  } catch (...) {
+      Serial.println("[SYS] Unknown logic bypass caught in main operating envelope loop.");
+  }
 }
